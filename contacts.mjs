@@ -2,16 +2,15 @@
 // month. All amounts here are debit-positive cents.
 //
 // - Debiteuren and Crediteuren use Moneybird's debtors and creditors reports,
-//   which give each contact's balance directly.
-// - Any other ledger account sums its journal entries per contact, from the
-//   start of the administration up to the month. Locked months are fetched in
-//   chunks of up to a year and cached for good. Later months are fetched one by
-//   one and also kept, but they are checked against the balance sheet: when the
-//   cached entries no longer add up to the account's balance, the monthly
-//   balance sheet shows which months changed, and only those are fetched again.
+//   which give each contact's balance directly (with a workaround for their
+//   unreliable pagination, see `fromReport`).
+// - Any other ledger account adds up its journal entries per contact, from the
+//   start of the administration up to the month. Moneybird has no per-contact
+//   report for those. See `fromJournalEntries` for how that stays affordable.
 import * as moneybird from "./moneybird/index.mjs";
-import { balancesById, parseCents, yyyymm } from "./util.mjs";
+import { addTo, balancesById, parseCents, parseMonthIndex, sumValues, withoutZeros, yyyymm } from "./util.mjs";
 
+// Taxonomy codes of Moneybird's default Debiteuren and Crediteuren accounts.
 const debtorsCode = "BVorDebHad";
 const creditorsCode = "BSchCreHac";
 
@@ -25,34 +24,16 @@ const creditTypes = new Set( [
   "revenue",
 ] );
 
-const sumBy = function( map, key, cents ) {
-  map.set( key, ( map.get( key ) ?? 0 ) + cents );
-};
-
-const withoutZeros = function( map ) {
-  for ( const [ key, cents ] of map ) {
-    if ( cents === 0 ) {
-      map.delete( key );
-    }
-  }
-
-  return map;
-};
-
-export const createDetailer = function( {
-  administrationId,
-  startIndex,
-  endIndex,
-  lockedIndex,
-  reportOptions,
-  refresh,
-  openByContact,
-} ) {
-  // Locked months in chunks per calendar year, later months one by one.
+// Splits the months from `start` to `end` (month indexes) into the periods to
+// fetch journal entries for. Locked months can't change, so they are fetched
+// in chunks per calendar year (reports allow at most 12 months), which keeps
+// the number of rate-limited report requests down. Later months are fetched
+// one by one, so a change only means fetching that month again.
+const planChunks = function( start, end, lockedIndex ) {
   const chunks = [];
-  for ( let index = startIndex; index <= endIndex; ) {
+  for ( let index = start; index <= end; ) {
     if ( index <= lockedIndex ) {
-      const to = Math.min( lockedIndex, endIndex, ( Math.floor( index / 12 ) * 12 ) + 11 );
+      const to = Math.min( lockedIndex, end, ( Math.floor( index / 12 ) * 12 ) + 11 );
       chunks.push( { from: index, to, locked: true } );
       index = to + 1;
     }
@@ -62,24 +43,37 @@ export const createDetailer = function( {
     }
   }
 
-  // Month index => balances by ledger account id, for the last locked month (or
-  // the month before the start) up to the end. Shared by all ledger accounts.
+  return chunks;
+};
+
+export const createContactBalances = function( {
+  administrationId,
+  startIndex,
+  endIndex,
+  lockedIndex,
+  reportOptions,
+  refresh,
+  // async ( "debtors" | "creditors" ) => Map( contactId => cents ) from open
+  // invoices, to fill in what the reports leave out.
+  openByContact,
+} ) {
+  const chunks = planChunks( startIndex, endIndex, lockedIndex );
+
+  // Month index => balances by ledger account id, from the last locked month
+  // (or the month before the start) up to the end. Loaded at most once and
+  // shared by all ledger accounts, as it costs report requests.
   let monthlyBalances;
   const loadMonthlyBalances = async function() {
     const balances = new Map( [ [ startIndex - 1, new Map() ] ] );
-    const from = Math.max( startIndex, lockedIndex );
-    for ( let index = from; index <= endIndex; index += 12 ) {
-      const to = Math.min( endIndex, index + 11 );
-      const period = `${ yyyymm( index ) }..${ yyyymm( to ) }`;
+    for ( let index = Math.max( startIndex, lockedIndex ); index <= endIndex; index += 12 ) {
+      const period = `${ yyyymm( index ) }..${ yyyymm( Math.min( endIndex, index + 11 ) ) }`;
       const sheet = await moneybird.balanceSheet( administrationId, period, {
         granularity: "month",
         ...reportOptions,
         label: `monthly balance sheets ${ period }`,
       } );
       for ( const item of sheet.periods ?? [] ) {
-        const year = Number( item.period.slice( 0, 4 ) );
-        const month = Number( item.period.slice( 4, 6 ) );
-        balances.set( ( year * 12 ) + month - 1, balancesById( item ) );
+        balances.set( parseMonthIndex( item.period ), balancesById( item ) );
       }
     }
 
@@ -87,11 +81,13 @@ export const createDetailer = function( {
   };
 
   // The debtors and creditors reports are paginated and sorted by amount, and
-  // the order of equal amounts is not stable between pages. Some contacts then
-  // show up twice and others not at all. Duplicates are dropped here. When
-  // the total does not match `expected`, contacts the report left out are
+  // the order of equal amounts isn't stable between pages. With many members
+  // owing the same contribution, some contacts then show up twice and others
+  // not at all (May 2025: 7 members of € 80 missing). Duplicates are dropped.
+  // When the total doesn't match `expected`, contacts the report left out are
   // added from their open invoices, but only if that closes the gap exactly.
-  const fromReport = async function( ledgerAccount, report, sign, source, expected ) {
+  const fromReport = async function( ledgerAccount, source, expected ) {
+    const [ report, sign ] = ( ( source === "debtors" ) ? [ moneybird.debtors, 1 ] : [ moneybird.creditors, -1 ] );
     const items = await report( administrationId, yyyymm( endIndex ), {
       ...reportOptions,
       label: `${ ledgerAccount.name } per contact`,
@@ -107,16 +103,7 @@ export const createDetailer = function( {
       byContact.set( contactId, sign * parseCents( amount ) );
     }
 
-    const total = function( map ) {
-      let sum = 0;
-      for ( const cents of map.values() ) {
-        sum += cents;
-      }
-
-      return sum;
-    };
-
-    if ( ( total( byContact ) !== expected ) && openByContact ) {
+    if ( sumValues( byContact ) !== expected ) {
       const filled = new Map( byContact );
       let added = 0;
       for ( const [ contactId, cents ] of await openByContact( source ) ) {
@@ -126,7 +113,7 @@ export const createDetailer = function( {
         }
       }
 
-      if ( total( filled ) === expected ) {
+      if ( sumValues( filled ) === expected ) {
         console.error( `Note: Moneybird's ${ source } report left out ${ added } contact(s)${ duplicates ? ` and listed ${ duplicates } twice` : "" }; added them from their open invoices.` );
         return {
           byContact: filled,
@@ -143,6 +130,13 @@ export const createDetailer = function( {
     };
   };
 
+  // Journal entries are the expensive part: thousands per account, and only 50
+  // report requests per 5 minutes. All chunks are cached without expiry, but
+  // the unlocked ones are checked: when the cached entries no longer add up to
+  // `expected` (the account's balance), the monthly balance sheet shows which
+  // months changed, and only those are fetched again. A change that leaves
+  // every monthly total the same (like moving a booking to another contact)
+  // goes unnoticed; --refresh covers that.
   const fromJournalEntries = async function( ledgerAccount, expected ) {
     const sign = ( creditTypes.has( ledgerAccount.account_type ) ? -1 : 1 );
     const cents = function( amount ) {
@@ -151,19 +145,19 @@ export const createDetailer = function( {
 
     const load = async function( chunk, force ) {
       const period = `${ yyyymm( chunk.from ) }..${ yyyymm( chunk.to ) }`;
-      const entries = await moneybird.journalEntries( administrationId, ledgerAccount.id, period, {
-        // Locked data never changes, so even --refresh leaves it alone.
+      chunk.entries = await moneybird.journalEntries( administrationId, ledgerAccount.id, period, {
         ttl: Infinity,
+        // Locked data never changes, so even --refresh leaves it alone.
         refresh: ( force || ( refresh && !chunk.locked ) ),
         label: `journal entries of ${ ledgerAccount.name } ${ period }`,
       } );
-      chunk.entries = entries;
-      chunk.movement = entries.reduce( function( total, { amount } ) {
+      chunk.movement = chunk.entries.reduce( function( total, { amount } ) {
         return ( total + cents( amount ) );
       }, 0 );
       chunk.fresh = force;
     };
 
+    // Copies, as the loaded entries differ per ledger account.
     const accountChunks = chunks.map( function( chunk ) {
       return { ...chunk };
     } );
@@ -171,17 +165,14 @@ export const createDetailer = function( {
       await load( chunk, false );
     }
 
-    const total = function() {
-      return accountChunks.reduce( function( sum, { movement } ) {
-        return ( sum + movement );
-      }, 0 );
-    };
-
-    if ( total() !== expected ) {
+    const total = accountChunks.reduce( function( sum, { movement } ) {
+      return ( sum + movement );
+    }, 0 );
+    if ( total !== expected ) {
       monthlyBalances ??= loadMonthlyBalances();
       const balances = await monthlyBalances;
       const balanceAt = function( index ) {
-        return balances.get( index )?.get( ledgerAccount.id ) ?? 0;
+        return ( balances.get( index )?.get( ledgerAccount.id ) ?? 0 );
       };
 
       for ( const chunk of accountChunks ) {
@@ -189,20 +180,19 @@ export const createDetailer = function( {
           continue;
         }
 
-        const movement = ( balanceAt( chunk.from ) - balanceAt( chunk.from - 1 ) );
-        if ( movement !== chunk.movement ) {
+        if ( chunk.movement !== ( balanceAt( chunk.from ) - balanceAt( chunk.from - 1 ) ) ) {
           await load( chunk, true );
         }
       }
     }
 
-    // Per contact the debit-positive total, and the entries behind it (which
-    // tell what document each amount comes from).
+    // Per contact the total, and the entries behind it: those tell which
+    // document each amount comes from, which is what the reasons need.
     const byContact = new Map();
     const entriesByContact = new Map();
     for ( const { entries } of accountChunks ) {
       for ( const { contact_id: contactId, amount, document_type: documentType, document_id: documentId } of entries ) {
-        sumBy( byContact, contactId, cents( amount ) );
+        addTo( byContact, contactId, cents( amount ) );
         if ( !entriesByContact.has( contactId ) ) {
           entriesByContact.set( contactId, [] );
         }
@@ -222,9 +212,9 @@ export const createDetailer = function( {
 
   // Returns { source, byContact, entriesByContact, difference }:
   // - `source` is "debtors", "creditors" or "journal";
-  // - `byContact` maps contact ids (or null) to cents;
+  // - `byContact` maps contact ids (or null) to cents, without zeros;
   // - `entriesByContact` holds the journal entries per contact ("journal" only);
-  // - `difference` is whatever part of `expected` the contacts do not explain.
+  // - `difference` is the part of `expected` that the contacts don't explain.
   return async function( ledgerAccount, expected ) {
     const code = ledgerAccount.taxonomy_item?.code;
     const source = ( ( code === debtorsCode )
@@ -234,29 +224,17 @@ export const createDetailer = function( {
     const {
       byContact,
       entriesByContact,
-    } = await ( {
-      debtors: function() {
-        return fromReport( ledgerAccount, moneybird.debtors, 1, "debtors", expected );
-      },
-      creditors: function() {
-        return fromReport( ledgerAccount, moneybird.creditors, -1, "creditors", expected );
-      },
-      journal: function() {
-        return fromJournalEntries( ledgerAccount, expected );
-      },
-    } )[ source ]();
+    } = await ( ( source === "journal" )
+      ? fromJournalEntries( ledgerAccount, expected )
+      : fromReport( ledgerAccount, source, expected )
+    );
     withoutZeros( byContact );
-
-    let sum = 0;
-    for ( const cents of byContact.values() ) {
-      sum += cents;
-    }
 
     return {
       source,
       byContact,
       entriesByContact,
-      difference: ( expected - sum ),
+      difference: ( expected - sumValues( byContact ) ),
     };
   };
 };

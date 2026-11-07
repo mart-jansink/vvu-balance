@@ -5,32 +5,61 @@
 // - Debiteuren: the sales invoices (and external ones) still open at the end of
 //   the month, i.e. their total minus the payments made up to then.
 // - Crediteuren: the purchase invoices and receipts still open, likewise.
-//   Payments made before the invoice date count as well (the invoice is then
-//   open for a negative amount). Purchase documents marked as revenue
-//   invoices are money owed to us, so Moneybird books them on Debiteuren
-//   instead, payments included.
+// - Payments made before the invoice date count as well. Moneybird has already
+//   booked them, so the invoice is open for a negative amount.
+// - Purchase documents marked as revenue invoices (such as a "Verrekening" or a
+//   Mollie / CM.com settlement) are money owed to VVU, so Moneybird books them
+//   on Debiteuren instead of Crediteuren, payments included.
 // - Other ledger accounts: the journal entries per contact are grouped by
-//   document. Each document's amount is split over its details (preferring
-//   details with a period, as those cause accruals), or for a general journal
-//   document over its other lines.
+//   document. Each document's amount is split over its details, or for a
+//   general journal document over its other lines.
 //
 // An invoice's open amount is split over its details in proportion to their
-// amounts excluding tax, plus the tax itself. Whatever part of a contact's
-// balance no invoice explains (like an unlinked payment) gets its own reason.
+// amounts excluding tax, plus the tax itself. Moneybird doesn't record which
+// line a partial payment was for, so a proportional split is the best guess.
+// Whatever part of a contact's balance no invoice explains (like an advance
+// payment that isn't linked) gets its own reason, so every breakdown still
+// adds up to the contact's balance.
 import { openAt } from "./documents.mjs";
+import { addTo, sumValues, withoutZeros } from "./util.mjs";
 
+// Reason keys are ledger account ids, or one of these.
 export const taxKey = "tax";
 export const unlinkedKey = "unlinked";
 export const unknownKey = "unknown";
-export const typeKeyPrefix = "type:";
+export const differenceKey = "difference";
+const typeKeyPrefix = "type:";
+
+const documentTypeLabels = {
+  FinancialMutation: "bankmutatie",
+  Payment: "betaling",
+};
+
+// The label of a reason key that is no ledger account, or null.
+export const specialReasonLabel = function( key ) {
+  switch ( key ) {
+    case taxKey:
+      return "(btw)";
+    case unlinkedKey:
+      return "(niet aan een factuur gekoppeld)";
+    case unknownKey:
+      return "(onbekend)";
+    case differenceKey:
+      return "(niet per contact te verklaren)";
+  }
+
+  if ( key.startsWith( typeKeyPrefix ) ) {
+    const type = key.slice( typeKeyPrefix.length );
+    return `(${ documentTypeLabels[ type ] ?? type })`;
+  }
+
+  return null;
+};
 
 // Splits `total` over `weights` (a Map of key => weight) proportionally, in
 // whole cents that add up to `total` exactly. Returns null without weights.
 export const allocate = function( total, weights ) {
-  let sum = 0;
-  for ( const weight of weights.values() ) {
-    sum += weight;
-  }
+  const sum = sumValues( weights );
   if ( sum === 0 ) {
     return null;
   }
@@ -55,24 +84,10 @@ export const allocate = function( total, weights ) {
   return result;
 };
 
-const addTo = function( map, key, cents ) {
-  map.set( key, ( map.get( key ) ?? 0 ) + cents );
-};
-
 const merge = function( target, source ) {
   for ( const [ key, cents ] of source ) {
     addTo( target, key, cents );
   }
-};
-
-const withoutZeros = function( map ) {
-  for ( const [ key, cents ] of map ) {
-    if ( cents === 0 ) {
-      map.delete( key );
-    }
-  }
-
-  return map;
 };
 
 // Weights of an invoice's details per ledger account, plus its tax.
@@ -81,27 +96,27 @@ const invoiceWeights = function( invoice ) {
   for ( const { ledgerAccountId, amount } of invoice.details ) {
     addTo( weights, ledgerAccountId, amount );
   }
-  const tax = ( invoice.totalInclTax - invoice.totalExclTax );
-  if ( tax !== 0 ) {
-    addTo( weights, taxKey, tax );
-  }
+  addTo( weights, taxKey, invoice.totalInclTax - invoice.totalExclTax );
 
   return withoutZeros( weights );
 };
 
-// Weights of the document behind an amount on `ledgerAccountId`: the details
-// (preferring those with a period), or the other lines of a journal document.
+// Weights of the document behind an amount on `ledgerAccountId`.
 const documentWeights = function( document, ledgerAccountId ) {
   const weights = new Map();
   if ( document.entries ) {
+    // A general journal document: its other lines are the reason. They offset
+    // the amount on `ledgerAccountId`, so their sign is flipped.
     for ( const entry of document.entries ) {
       if ( entry.ledgerAccountId !== ledgerAccountId ) {
-        // The other lines offset the amount, so flip their sign.
         addTo( weights, entry.ledgerAccountId, -entry.amount );
       }
     }
   }
   else {
+    // An invoice or receipt. Details with a period are what cause accruals
+    // (like "Nog te betalen kosten" for a June cost on a November invoice),
+    // so those are preferred when there are any.
     const others = document.details.filter( function( detail ) {
       return ( detail.ledgerAccountId !== ledgerAccountId );
     } );
@@ -116,39 +131,37 @@ const documentWeights = function( document, ledgerAccountId ) {
   return withoutZeros( weights );
 };
 
+const always = function() {
+  return true;
+};
+const isRevenueInvoice = function( invoice ) {
+  return invoice.revenueInvoice;
+};
+const isNoRevenueInvoice = function( invoice ) {
+  return !invoice.revenueInvoice;
+};
+
+// The documents behind each side, as [ collection, sign, filter ]. Sales
+// invoices are debit-positive already; purchase documents are flipped.
+const sources = {
+  debtors: [
+    [ "salesInvoices", 1, always ],
+    [ "externalSalesInvoices", 1, always ],
+    [ "purchaseInvoices", -1, isRevenueInvoice ],
+    [ "receipts", -1, isRevenueInvoice ],
+  ],
+  creditors: [
+    [ "purchaseInvoices", -1, isNoRevenueInvoice ],
+    [ "receipts", -1, isNoRevenueInvoice ],
+  ],
+};
+
 export const createReasoner = function( {
   loadDocuments,
   date,
 } ) {
-  // Purchase documents marked as revenue invoices are receivables, booked on
-  // Debiteuren instead of Crediteuren.
-  const onDebtors = function( invoice ) {
-    return invoice.revenueInvoice;
-  };
-
-  // Invoices still open at `date`, grouped per contact, for one side. Sales
-  // invoices are debit-positive already; purchase documents are flipped.
-  const sources = {
-    debtors: [
-      [ "salesInvoices", 1, function() {
-        return true;
-      } ],
-      [ "externalSalesInvoices", 1, function() {
-        return true;
-      } ],
-      [ "purchaseInvoices", -1, onDebtors ],
-      [ "receipts", -1, onDebtors ],
-    ],
-    creditors: [
-      [ "purchaseInvoices", -1, function( invoice ) {
-        return !onDebtors( invoice );
-      } ],
-      [ "receipts", -1, function( invoice ) {
-        return !onDebtors( invoice );
-      } ],
-    ],
-  };
-
+  // Per side, the invoices still open at `date` grouped per contact, as
+  // [ invoice, debit-positive cents ] pairs. Loaded at most once per side.
   const openInvoices = new Map();
   const loadOpenInvoices = function( source ) {
     if ( !openInvoices.has( source ) ) {
@@ -191,17 +204,12 @@ export const createReasoner = function( {
   const fromInvoices = async function( source, byContact ) {
     const open = await loadOpenInvoices( source );
     const result = new Map();
-    for ( const [ contactId, expected ] of byContact ) {
+    for ( const [ contactId, balance ] of byContact ) {
       const reasons = new Map();
       for ( const [ invoice, cents ] of open.get( contactId ) ?? [] ) {
         merge( reasons, allocate( cents, invoiceWeights( invoice ) ) ?? new Map( [ [ unknownKey, cents ] ] ) );
       }
-
-      let explained = 0;
-      for ( const cents of reasons.values() ) {
-        explained += cents;
-      }
-      addTo( reasons, unlinkedKey, expected - explained );
+      addTo( reasons, unlinkedKey, balance - sumValues( reasons ) );
       result.set( contactId, withoutZeros( reasons ) );
     }
 
@@ -229,6 +237,8 @@ export const createReasoner = function( {
           continue;
         }
 
+        // Bank mutations and payments aren't in the synced collections; their
+        // type is the best available reason.
         const document = documents.get( documentId );
         const split = ( document ? allocate( amount, documentWeights( document, ledgerAccount.id ) ) : null );
         merge( reasons, split ?? new Map( [ [ `${ typeKeyPrefix }${ documentType }`, amount ] ] ) );
@@ -239,17 +249,13 @@ export const createReasoner = function( {
     return result;
   };
 
-  // Returns Map( contactId => Map( reason key => cents ) ). A reason key is a
-  // ledger account id, or one of the keys exported above.
+  // Takes a ledger account and the result of the contact balances for it, and
+  // returns Map( contactId => Map( reason key => cents ) ).
   const reasoner = function( ledgerAccount, { source, byContact, entriesByContact } ) {
-    switch ( source ) {
-      case "debtors":
-      case "creditors":
-        return fromInvoices( source, byContact );
-
-      default:
-        return fromEntries( ledgerAccount, byContact, entriesByContact );
-    }
+    return ( ( source === "journal" )
+      ? fromEntries( ledgerAccount, byContact, entriesByContact )
+      : fromInvoices( source, byContact )
+    );
   };
 
   // The open invoices of one side ("debtors" or "creditors") as Map(

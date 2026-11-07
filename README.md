@@ -74,3 +74,19 @@ Responses are stored in `.cache/`, next to `index.mjs`.
 - `--refresh` fetches everything that isn't locked again. `--clear-cache` wipes the whole cache, including locked data.
 
 On a 429 the client waits for `Retry-After` and retries, so the first run can take several minutes.
+
+## Code
+
+| File | What it does |
+| --- | --- |
+| `index.mjs` | Ties it together: fetches the balance sheet, adds the breakdowns, prints the output |
+| `cli.mjs` | Options, usage text and picking the administration |
+| `moneybird/` | API client: rate-limit retries, pagination, synchronization endpoints and the disk cache |
+| `ledger.mjs` | Ledger account lookups: names, parents, account types, `-d` names to ids |
+| `sheet.mjs` | Turns the balance sheet report into sections, groups and lines per side |
+| `contacts.mjs` | Balance per contact on a ledger account (debtors/creditors reports, or journal entries) |
+| `documents.mjs` | Local copies of invoices, receipts and journal documents |
+| `reasons.mjs` | Splits a contact's balance over the ledger accounts of the documents behind it |
+| `breakdown.mjs` | Adds the per-contact and per-reason breakdowns to the sheet |
+| `output/` | Table, JSON and CSV output |
+| `util.mjs` | Amounts in cents and month arithmetic |

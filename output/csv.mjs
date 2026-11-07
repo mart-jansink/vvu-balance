@@ -7,7 +7,9 @@
 //   soort (the reason's account type, such as opbrengsten or kosten, which
 //   tells apart groups with the same name), bedrag
 //
-// The format suits a Dutch spreadsheet: ";" between fields and a decimal comma.
+// The format suits a Dutch spreadsheet: ";" between fields, a decimal comma
+// without thousands separators, and CRLF line endings.
+import { toDecimal } from "../util.mjs";
 
 const columns = [ "datum", "zijde", "blok", "sectie", "groep", "rekening", "contact", "redengroep", "reden", "soort", "bedrag" ];
 
@@ -17,12 +19,13 @@ const field = function( value ) {
 };
 
 const amount = function( cents ) {
-  return ( cents / 100 ).toFixed( 2 ).replace( ".", "," );
+  return toDecimal( cents ).replace( ".", "," );
 };
 
-// `sides` is [ [ "activa", side ], [ "passiva", side ] ] as built by index.mjs.
-// `typeOf( ledgerAccountId )` gives the label for the "soort" column.
-export const toCsv = function( date, sides, typeOf ) {
+// Returns { text, count } for the balance sheet tree (see sheet.mjs) at
+// `date`. The ledger gives the "soort" column.
+export const toCsv = function( { date, sheet, ledger } ) {
+  const sides = [ [ "activa", sheet.debit ], [ "passiva", sheet.credit ] ];
   const rows = [];
   const push = function( row ) {
     rows.push( {
@@ -44,7 +47,7 @@ export const toCsv = function( date, sides, typeOf ) {
           ...base,
           redengroep: group ?? reason.name,
           reden: reason.name,
-          soort: ( reason.id ? typeOf( reason.id ) : "" ),
+          soort: ( reason.id ? ledger.typeLabel( reason.id ) : "" ),
           bedrag: reason.amount,
         } );
       }

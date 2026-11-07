@@ -1,3 +1,5 @@
+// A small Moneybird API v2 client with a disk cache (see cache.mjs).
+// https://developer.moneybird.com/
 import { setTimeout as sleep } from "node:timers/promises";
 
 import * as cache from "./cache.mjs";
@@ -6,8 +8,8 @@ const baseUrl = "https://moneybird.com/api/v2";
 const maxRetries = 10;
 const perPage = 100;
 
-export const minute = 60 * 1000;
-export const day = 24 * 60 * minute;
+const minute = 60 * 1000;
+const day = 24 * 60 * minute;
 
 let verbose = false;
 export const setVerbose = function( value ) {
@@ -186,6 +188,23 @@ export const journalEntries = function( administrationId, ledgerAccountId, perio
   return getAll( `${ administrationId }/reports/journal_entries.json?ledger_account_id=${ ledgerAccountId }&period=${ period }`, options );
 };
 
+// Full records by id through a collection's synchronization endpoint, which
+// takes at most 100 ids per request. This is much cheaper on the rate limit
+// than fetching records one by one.
+const fetchByIds = async function( administrationId, collection, ids ) {
+  const records = [];
+  for ( let i = 0; i < ids.length; i += perPage ) {
+    records.push( ...await fetchJson( urlFor( `${ administrationId }/${ collection }/synchronization.json` ), {
+      method: "POST",
+      body: {
+        ids: ids.slice( i, i + perPage ),
+      },
+    } ) );
+  }
+
+  return records;
+};
+
 // Every record of a collection that has synchronization endpoints (like
 // "sales_invoices" or "documents/purchase_invoices"), as a Map by id. A local
 // copy is kept in the cache. Each run lists the ids and versions (one request,
@@ -202,6 +221,9 @@ export const synced = async function( administrationId, collection, slim, {
     refresh,
   } );
 
+  // Not a real endpoint, just the cache key of the local copy. Records with an
+  // unchanged version are reused even with `refresh`: a version only stays the
+  // same when the record does.
   const storeUrl = urlFor( `${ administrationId }/${ collection }/all?schema=${ schema }` );
   const stored = new Map( Object.entries( ( await cache.read( storeUrl, Infinity ) ) ?? {} ) );
 
@@ -221,16 +243,8 @@ export const synced = async function( administrationId, collection, slim, {
     if ( !verbose ) {
       console.error( `Fetching ${ missing.length } changed ${ collection }…` );
     }
-    for ( let i = 0; i < missing.length; i += 100 ) {
-      const fetched = await fetchJson( urlFor( `${ administrationId }/${ collection }/synchronization.json` ), {
-        method: "POST",
-        body: {
-          ids: missing.slice( i, i + 100 ),
-        },
-      } );
-      for ( const record of fetched ) {
-        records.set( record.id, slim( record ) );
-      }
+    for ( const record of await fetchByIds( administrationId, collection, missing ) ) {
+      records.set( record.id, slim( record ) );
     }
   }
 
@@ -242,8 +256,8 @@ export const synced = async function( administrationId, collection, slim, {
   return records;
 };
 
-// Contacts by id, cached per contact. Missing ones are fetched in bulk through
-// the synchronization endpoint (at most 100 per request).
+// Contacts by id, cached per contact (for a week by default: only their names
+// are used). Missing ones are fetched in bulk.
 export const contacts = async function( administrationId, ids, {
   ttl = 7 * day,
   refresh = false,
@@ -260,17 +274,9 @@ export const contacts = async function( administrationId, ids, {
     }
   }
 
-  for ( let i = 0; i < missing.length; i += 100 ) {
-    const fetched = await fetchJson( urlFor( `${ administrationId }/contacts/synchronization.json` ), {
-      method: "POST",
-      body: {
-        ids: missing.slice( i, i + 100 ),
-      },
-    } );
-    for ( const contact of fetched ) {
-      byId.set( contact.id, contact );
-      await cache.write( urlFor( `${ administrationId }/contacts/${ contact.id }.json` ), contact );
-    }
+  for ( const contact of await fetchByIds( administrationId, "contacts", missing ) ) {
+    byId.set( contact.id, contact );
+    await cache.write( urlFor( `${ administrationId }/contacts/${ contact.id }.json` ), contact );
   }
 
   return byId;

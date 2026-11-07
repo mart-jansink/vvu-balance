@@ -12,6 +12,8 @@ node index.mjs 2026-10 -c -l            # per contact, then per reason
 node index.mjs 2026-10 -d Debiteuren -l # per reason, only for Debiteuren
 node index.mjs 2026-10 --sum            # totals per reason for activa and passiva (-s)
 node index.mjs 2026-10 --json
+node index.mjs 2026-10 -s -c -l --csv balans-202610.csv   # also write a CSV file
+node index.mjs 2026-10 -c --csv - > debiteuren.csv        # CSV to stdout instead of the table
 node index.mjs --help
 ```
 
@@ -45,6 +47,18 @@ Your chart of accounts uses the same names for revenue and expense accounts, suc
 - Part of a contact's balance may not belong to any open invoice, for example an advance payment or a payment that isn't linked to an invoice. That part is shown as "(niet aan een factuur gekoppeld)", so every breakdown still adds up to the contact's balance.
 
 All invoices and documents are kept locally in `.cache/`. Each run asks Moneybird for the ids and versions (one request per type, cached for `--ttl`) and fetches only new or changed records, 100 per request. The first run fetches about 8,000 records, which takes a few minutes. After that it is quick.
+
+## CSV
+
+`--csv FILE` also writes the result as CSV, with the same breakdown as the flags you pass. With `-`, it prints the CSV to stdout instead of the table.
+
+- There is one row per amount: only the lowest level of the tree, never subtotals. That way a spreadsheet or pivot table adds up correctly.
+- Columns: `datum;zijde;blok;sectie;groep;rekening;contact;redengroep;reden;soort;bedrag`.
+  - `blok` is `balans` for the balance sheet, or `per grootboekrekening` for the `--sum` totals. Filter on it, or totals count twice.
+  - `rekening` is the balance-sheet ledger account, such as Debiteuren or Vooruitgefactureerde kosten.
+  - `redengroep` and `reden` are the parent and the ledger account of the reason.
+  - `soort` is the reason's account type (opbrengsten / kosten). Use it to tell apart groups with the same name, such as "Verbindend".
+- The format suits a Dutch Excel: `;` between fields, a decimal comma without thousands separators (`32732,95`), and CRLF line endings. A file starts with a UTF-8 byte order mark so Excel shows accents correctly ("Financiële"). Stdout output has no byte order mark.
 
 ## Caching
 

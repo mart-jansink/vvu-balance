@@ -1,8 +1,10 @@
 #!/usr/bin/env node
+import { writeFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 
 import * as moneybird from "./moneybird/index.mjs";
 import { clear as clearCache } from "./moneybird/cache.mjs";
+import { toCsv } from "./csv.mjs";
 import { createDetailer } from "./detail.mjs";
 import { createDocuments } from "./documents.mjs";
 import { createReasoner, taxKey, typeKeyPrefix, unknownKey, unlinkedKey } from "./reasons.mjs";
@@ -33,6 +35,8 @@ Options:
   -r, --refresh            Ignore cached responses for months that are not locked
       --clear-cache        Delete the whole cache and exit
       --json               Print JSON instead of a table
+      --csv FILE           Also write the result as CSV (";" and decimal comma,
+                           one row per amount); "-" prints it instead of a table
   -v, --verbose            Log requests and cache hits to stderr
   -h, --help               Show this help
 
@@ -57,6 +61,7 @@ try {
       refresh: { type: "boolean", short: "r", default: false },
       "clear-cache": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
+      csv: { type: "string" },
       verbose: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -157,6 +162,10 @@ if ( positionals.length > 1 ) {
   fail( "Too many arguments." );
 }
 
+if ( options.json && ( options.csv === "-" ) ) {
+  fail( "Use either --json or --csv -, both print to stdout." );
+}
+
 const ttlMinutes = Number( options.ttl );
 if ( !Number.isFinite( ttlMinutes ) || ( ttlMinutes < 0 ) ) {
   fail( `Invalid --ttl "${ options.ttl }".` );
@@ -201,6 +210,17 @@ const ledgerAccountsById = new Map( ledgerAccounts.map( function( ledgerAccount 
 } ) );
 const nameOf = function( id ) {
   return ( ledgerAccountsById.get( id )?.name ?? `Ledger account ${ id }` );
+};
+
+// Dutch labels for ledger account types (for names shared by a revenue and an
+// expenses account, and the CSV "soort" column).
+const typeLabels = {
+  revenue: "opbrengsten",
+  expenses: "kosten",
+  direct_costs: "directe kosten",
+  other_income_expenses: "overige baten en lasten",
+  current_assets: "vlottende activa",
+  current_liabilities: "kortlopende schulden",
 };
 
 const sum = function( items ) {
@@ -448,12 +468,6 @@ if ( detailLines.length > 0 ) {
   // Different ledger accounts can share a name (like a revenue and an expenses
   // account both called "Verbindend"). Within one level, tell those apart by
   // their type.
-  const typeLabels = {
-    revenue: "opbrengsten",
-    expenses: "kosten",
-    direct_costs: "directe kosten",
-    other_income_expenses: "overige baten en lasten",
-  };
   const labelDuplicates = function( items ) {
     const counts = new Map();
     for ( const { name } of items ) {
@@ -631,6 +645,33 @@ if ( detailLines.length > 0 ) {
   }
 }
 
+// Waits for stdout to take everything: exiting right away truncates large
+// output when stdout is a pipe.
+const print = function( text ) {
+  return new Promise( function( resolve ) {
+    process.stdout.write( text, resolve );
+  } );
+};
+
+if ( options.csv ) {
+  const {
+    text,
+    count,
+  } = toCsv( lastDay, [ [ "activa", debit ], [ "passiva", credit ] ], function( id ) {
+    const type = ledgerAccountsById.get( id )?.account_type;
+    return ( typeLabels[ type ] ?? type ?? "" );
+  } );
+  if ( options.csv === "-" ) {
+    await print( text );
+    process.exit( 0 );
+  }
+
+  // A byte order mark makes Excel read the file as UTF-8 (for names like
+  // "Financiële rekeningen").
+  await writeFile( options.csv, `\uFEFF${ text }` );
+  console.error( `Wrote ${ count } rows to ${ options.csv }.` );
+}
+
 if ( options.json ) {
   // A line with its optional `contacts` and `reasons`, recursively.
   const line = function( { id, name, amount, contacts, reasons } ) {
@@ -685,11 +726,7 @@ if ( options.json ) {
     credit: side( credit ),
   }, null, 2 );
 
-  // Wait for the write to finish: exiting right away truncates large output
-  // when stdout is a pipe.
-  await new Promise( function( resolve ) {
-    process.stdout.write( `${ json }\n`, resolve );
-  } );
+  await print( `${ json }\n` );
   process.exit( 0 );
 }
 

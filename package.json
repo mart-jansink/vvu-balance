@@ -1,0 +1,17 @@
+{
+  "name": "balance",
+  "version": "1.0.0",
+  "description": "Bank balance at the end of a given month, from the Moneybird API",
+  "type": "module",
+  "main": "index.mjs",
+  "bin": {
+    "balance": "index.mjs"
+  },
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "private": true
+}

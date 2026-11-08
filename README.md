@@ -11,6 +11,7 @@ node index.mjs 2026-10 --reasons        # per reason, e.g. Contributie senioren 
 node index.mjs 2026-10 -c -l            # per contact, then per reason
 node index.mjs 2026-10 -d Debiteuren -l # per reason, only for Debiteuren
 node index.mjs 2026-10 --sum            # totals per reason for activa and passiva (-s)
+node index.mjs 2025-12 -c --open        # plus what is still open of it today (-o)
 node index.mjs 2026-10 --json
 node index.mjs 2026-10 -s -c -l --csv balans-202610.csv   # also write a CSV file
 node index.mjs 2026-10 -c --csv - > debiteuren.csv        # CSV to stdout instead of the table
@@ -48,16 +49,30 @@ Your chart of accounts uses the same names for revenue and expense accounts, suc
 
 All invoices and documents are kept locally in `.cache/`. Each run asks Moneybird for the ids and versions (one request per type, cached for `--ttl`) and fetches only new or changed records, 100 per request. The first run fetches about 8,000 records, which takes a few minutes. After that it is quick.
 
+## Still open today
+
+`--open` (`-o`) adds a column with what is still open **today** of each broken-down amount. That's the month-end amount minus what was settled since; anything booked after the month doesn't count. Use it after a year end to see which of the debts at 31 December are still unpaid. Like `-l` and `-s`, it breaks down the default ledger accounts (or those from `-d`) without implying `-c`. Combine it with `-c`, `-l` and `-s` to see the column on contacts, reasons and totals. For a month that hasn't ended yet it prints a note and does nothing.
+
+- **Debiteuren and Crediteuren**: the invoices that were open at the end of the month, with their open amount today. That's exact, because Moneybird links payments to invoices. It's split over the reasons the same way as the month-end amount.
+  - An invoice paid twice is open for a negative amount: a refund that is owed.
+  - A payment made before its invoice's date is a negative amount at the month end. Once the invoice is dated it's settled (0). So a contact who paid next season's contribution in advance can owe more today than the net amount at the month end: the older debt is still there, while the advance went to the new invoice.
+- **"(niet aan een factuur gekoppeld)" and "(niet per contact te verklaren)"** stay open as they are. A payment linked to an invoice since then already counts as an early payment on that invoice, so what's left is still unlinked.
+- **Other ledger accounts** (such as Nog te betalen kosten) have no invoices to follow. The journal entries since the month that go against a contact's balance, such as a payment or a reversal, settle it, oldest amounts first. Entries in the same direction are new amounts and are ignored. What's still open is split over the contact's reasons in proportion.
+  - Journal entries don't record what they settle. So a newer booking that gets reversed looks like the older amount being settled.
+- Groups such as Overige vorderingen get the column when all their sub-accounts were broken down. Section and side totals don't, as they also include accounts like the bank.
+- This needs the journal entries from the month up to today as well. They're fetched and cached like the others, so the first run for an old month takes longer.
+
 ## CSV
 
 `--csv FILE` also writes the result as CSV, with the same breakdown as the flags you pass. With `-`, it prints the CSV to stdout instead of the table.
 
 - There is one row per amount: only the lowest level of the tree, never subtotals. That way a spreadsheet or pivot table adds up correctly.
-- Columns: `datum;zijde;blok;sectie;groep;rekening;contact;redengroep;reden;soort;bedrag`.
+- Columns: `datum;zijde;blok;sectie;groep;rekening;contact;redengroep;reden;soort;bedrag`, plus `opendatum;open` with `--open`.
   - `blok` is `balans` for the balance sheet, or `per grootboekrekening` for the `--sum` totals. Filter on it, or totals count twice.
   - `rekening` is the balance-sheet ledger account, such as Debiteuren or Vooruitgefactureerde kosten.
   - `redengroep` and `reden` are the parent and the ledger account of the reason.
   - `soort` is the reason's account type (opbrengsten / kosten). Use it to tell apart groups with the same name, such as "Verbindend".
+  - `open` is what is still open of `bedrag` on `opendatum` (today). It's empty for ledger accounts that weren't broken down.
 - The format suits a Dutch Excel: `;` between fields, a decimal comma without thousands separators (`32732,95`), and CRLF line endings. A file starts with a UTF-8 byte order mark so Excel shows accents correctly ("Financiële"). Stdout output has no byte order mark.
 
 ## Caching

@@ -15,7 +15,7 @@ import { toJson } from "./output/json.mjs";
 import { toTable } from "./output/table.mjs";
 import { createReasoner } from "./reasons.mjs";
 import { buildSheet } from "./sheet.mjs";
-import { lastDayOf, lockedMonthIndex, monthIndex, pad, today } from "./util.mjs";
+import { lastDayOf, lockedMonthIndex, monthIndex, pad, parseMonthIndex, today } from "./util.mjs";
 
 // Waits until stdout has taken everything: exiting right after a write
 // truncates large output when stdout is a pipe.
@@ -53,7 +53,8 @@ const date = lastDayOf( year, month );
 // Bookings in a locked period can no longer change, so reports about it are
 // cached for good. Anything later may still change and gets a limited TTL.
 const locked = ( Boolean( lockedUntil ) && ( date <= lockedUntil ) );
-const ended = ( date < today( administration.time_zone ) );
+const currentDate = today( administration.time_zone );
+const ended = ( date < currentDate );
 const reportOptions = {
   ttl: ( locked ? Infinity : cli.ttl ),
   refresh: options.refresh,
@@ -68,6 +69,17 @@ const [ report, ledgerAccounts ] = await Promise.all( [
 const ledger = createLedger( ledgerAccounts );
 const sheet = buildSheet( report, ledger );
 
+// --open compares the month end with today, so it needs a month that ended.
+let openDate = null;
+if ( options.open ) {
+  if ( ended ) {
+    openDate = currentDate;
+  }
+  else {
+    console.error( "Note: this month has not ended yet, so --open has nothing to show." );
+  }
+}
+
 if ( cli.detail.length > 0 ) {
   const [ startYear, startMonth ] = ( administration.period_start_date ?? "2000-01" ).split( "-" ).map( Number );
 
@@ -79,6 +91,7 @@ if ( cli.detail.length > 0 ) {
       refresh: options.refresh,
     } ),
     date,
+    openDate,
   } );
 
   await addBreakdowns( {
@@ -88,6 +101,7 @@ if ( cli.detail.length > 0 ) {
     showContacts: cli.showContacts,
     showReasons: cli.showReasons,
     sum: options.sum,
+    open: Boolean( openDate ),
     contactBalances: createContactBalances( {
       administrationId,
       startIndex: monthIndex( startYear, startMonth ),
@@ -96,6 +110,13 @@ if ( cli.detail.length > 0 ) {
       reportOptions,
       refresh: options.refresh,
       openByContact: reasoner.openByContact,
+      openDate,
+      openIndex: ( openDate ? parseMonthIndex( openDate.replace( "-", "" ) ) : null ),
+      // The current month is never locked.
+      openReportOptions: {
+        ttl: cli.ttl,
+        refresh: options.refresh,
+      },
     } ),
     reasoner,
     loadContacts: function( ids ) {
@@ -110,7 +131,7 @@ if ( options.csv ) {
   const {
     text,
     count,
-  } = toCsv( { date, sheet, ledger } );
+  } = toCsv( { date, openDate, sheet, ledger } );
   if ( options.csv === "-" ) {
     await print( text );
     process.exit( 0 );
@@ -123,6 +144,6 @@ if ( options.csv ) {
 }
 
 await print( options.json
-  ? toJson( { administration, period, date, locked, ended, sheet } )
-  : toTable( { administration, date, ended, locked, lockedUntil, sheet } )
+  ? toJson( { administration, period, date, openDate, locked, ended, sheet } )
+  : toTable( { administration, date, openDate, ended, locked, lockedUntil, sheet } )
 );

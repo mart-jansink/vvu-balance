@@ -1,18 +1,24 @@
 // --json: the balance sheet tree with amounts as decimal strings ("123.45").
+// With --open, `openDate` is set and nodes with a still-open amount get `open`.
 import { toDecimal } from "../util.mjs";
 
+const openField = function( open ) {
+  return ( ( open === undefined ) ? {} : { open: toDecimal( open ) } );
+};
+
 // A line with its optional `contacts` and `reasons`, recursively.
-const line = function( { id, name, amount, contacts, reasons } ) {
+const line = function( { id, name, amount, open, contacts, reasons } ) {
   return {
     id,
     name,
     amount: toDecimal( amount ),
+    ...openField( open ),
     ...( contacts ? { contacts: contacts.map( line ) } : {} ),
     ...( reasons ? { reasons: reasons.map( line ) } : {} ),
   };
 };
 
-const side = function( { amount, sections, reasons, reasonsAmount } ) {
+const side = function( { amount, sections, reasons, reasonsAmount, reasonsOpen } ) {
   return {
     total: toDecimal( amount ),
     ...( reasons
@@ -20,6 +26,7 @@ const side = function( { amount, sections, reasons, reasonsAmount } ) {
         // --sum: totals per reason over the broken-down ledger accounts.
         reasons: {
           total: toDecimal( reasonsAmount ),
+          ...openField( reasonsOpen ),
           items: reasons.map( line ),
         },
       }
@@ -45,6 +52,7 @@ export const toJson = function( {
   administration,
   period,
   date,
+  openDate,
   locked,
   ended,
   sheet,
@@ -56,6 +64,7 @@ export const toJson = function( {
     },
     period,
     date,
+    ...( openDate ? { openDate } : {} ),
     locked,
     ended,
     currency: administration.currency,

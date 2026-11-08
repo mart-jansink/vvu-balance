@@ -20,6 +20,16 @@
 // Whatever part of a contact's balance no invoice explains (like an advance
 // payment that isn't linked) gets its own reason, so every breakdown still
 // adds up to the contact's balance.
+//
+// With `openDate` (--open), the same is done for what is still open on that
+// date of each contact's balance:
+//
+// - Debiteuren and Crediteuren: the invoices open at the end of the month,
+//   with their open amount on `openDate`. That's exact, as payments are
+//   linked to invoices. Unlinked amounts stay open as they are: payments that
+//   got linked since show up as early payments on their invoice instead.
+// - Other ledger accounts: contacts.mjs works out what is still open of the
+//   contact's balance, which is split over its reasons proportionally.
 import { openAt } from "./documents.mjs";
 import { addTo, sumValues, withoutZeros } from "./util.mjs";
 
@@ -159,9 +169,10 @@ const sources = {
 export const createReasoner = function( {
   loadDocuments,
   date,
+  openDate,
 } ) {
   // Per side, the invoices still open at `date` grouped per contact, as
-  // [ invoice, debit-positive cents ] pairs. Loaded at most once per side.
+  // [ invoice, debit-positive cents, sign ]. Loaded at most once per side.
   const openInvoices = new Map();
   const loadOpenInvoices = function( source ) {
     if ( !openInvoices.has( source ) ) {
@@ -177,7 +188,7 @@ export const createReasoner = function( {
             if ( !byContact.has( invoice.contactId ) ) {
               byContact.set( invoice.contactId, [] );
             }
-            byContact.get( invoice.contactId ).push( [ invoice, sign * open ] );
+            byContact.get( invoice.contactId ).push( [ invoice, sign * open, sign ] );
           }
         }
 
@@ -202,18 +213,33 @@ export const createReasoner = function( {
   };
 
   const fromInvoices = async function( source, byContact ) {
-    const open = await loadOpenInvoices( source );
+    const invoices = await loadOpenInvoices( source );
     const result = new Map();
+    const openResult = ( openDate ? new Map() : null );
     for ( const [ contactId, balance ] of byContact ) {
       const reasons = new Map();
-      for ( const [ invoice, cents ] of open.get( contactId ) ?? [] ) {
-        merge( reasons, allocate( cents, invoiceWeights( invoice ) ) ?? new Map( [ [ unknownKey, cents ] ] ) );
+      const open = new Map();
+      for ( const [ invoice, cents, sign ] of invoices.get( contactId ) ?? [] ) {
+        const weights = invoiceWeights( invoice );
+        const split = function( amount ) {
+          return ( allocate( amount, weights ) ?? new Map( [ [ unknownKey, amount ] ] ) );
+        };
+        merge( reasons, split( cents ) );
+        if ( openDate ) {
+          merge( open, split( sign * openAt( invoice, openDate ) ) );
+        }
       }
-      addTo( reasons, unlinkedKey, balance - sumValues( reasons ) );
+      const unlinked = ( balance - sumValues( reasons ) );
+      addTo( reasons, unlinkedKey, unlinked );
+      addTo( open, unlinkedKey, unlinked );
       result.set( contactId, withoutZeros( reasons ) );
+      openResult?.set( contactId, withoutZeros( open ) );
     }
 
-    return result;
+    return {
+      reasons: result,
+      open: openResult,
+    };
   };
 
   const fromEntries = async function( ledgerAccount, byContact, entriesByContact ) {
@@ -249,13 +275,33 @@ export const createReasoner = function( {
     return result;
   };
 
+  // What is still open of each contact's balance, split over its reasons in
+  // proportion (see contacts.mjs for how much that is).
+  const openFromEntries = function( reasonsByContact, stillOpen ) {
+    const result = new Map();
+    for ( const [ contactId, reasons ] of reasonsByContact ) {
+      const cents = ( stillOpen.get( contactId ) ?? 0 );
+      const split = ( ( cents === 0 ) ? new Map() : ( allocate( cents, reasons ) ?? new Map( [ [ unknownKey, cents ] ] ) ) );
+      result.set( contactId, withoutZeros( split ) );
+    }
+
+    return result;
+  };
+
   // Takes a ledger account and the result of the contact balances for it, and
-  // returns Map( contactId => Map( reason key => cents ) ).
-  const reasoner = function( ledgerAccount, { source, byContact, entriesByContact } ) {
-    return ( ( source === "journal" )
-      ? fromEntries( ledgerAccount, byContact, entriesByContact )
-      : fromInvoices( source, byContact )
-    );
+  // returns { reasons, open }, both Map( contactId => Map( reason key => cents
+  // ) ): the reasons of each contact's balance, and of what is still open of
+  // it at `openDate` (null without).
+  const reasoner = async function( ledgerAccount, { source, byContact, entriesByContact, stillOpen } ) {
+    if ( source !== "journal" ) {
+      return fromInvoices( source, byContact );
+    }
+
+    const reasons = await fromEntries( ledgerAccount, byContact, entriesByContact );
+    return {
+      reasons,
+      open: ( openDate ? openFromEntries( reasons, stillOpen ) : null ),
+    };
   };
 
   // The open invoices of one side ("debtors" or "creditors") as Map(

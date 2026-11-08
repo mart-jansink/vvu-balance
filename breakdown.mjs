@@ -8,12 +8,33 @@
 //
 // A reason tree is [ { id, name, amount, reasons? } ]: ledger accounts nested
 // below their parents, each parent with the subtotal of its children.
+//
+// With `open` (--open), each of these also gets `open`: what is still open of
+// `amount` today (see reasons.mjs), and so do groups whose sub-accounts all
+// have it.
 import { differenceKey, specialReasonLabel } from "./reasons.mjs";
 import { ownLines } from "./sheet.mjs";
-import { addTo, sumAmounts, toDecimal, withoutZeros } from "./util.mjs";
+import { addTo, sumAmounts, sumValues, toDecimal, withoutZeros } from "./util.mjs";
+
+const sumOpen = function( items ) {
+  return items.reduce( function( total, { open } ) {
+    return ( total + open );
+  }, 0 );
+};
+
+const merge = function( target, source ) {
+  for ( const [ key, cents ] of source ) {
+    addTo( target, key, cents );
+  }
+};
 
 const byName = function( a, b ) {
   return a.name.localeCompare( b.name, "nl" );
+};
+
+// `sign * cents` without -0, which would print as "-0.00".
+const signed = function( sign, cents ) {
+  return ( ( sign * cents ) || 0 );
 };
 
 const contactName = function( contact, id ) {
@@ -32,6 +53,7 @@ export const addBreakdowns = async function( {
   showContacts,
   showReasons,
   sum,
+  open,
   // From contacts.mjs and reasons.mjs.
   contactBalances,
   reasoner,
@@ -59,18 +81,25 @@ export const addBreakdowns = async function( {
   };
 
   // A reason tree from a Map of reason key => debit-positive cents, in the
-  // side's sign. Sorted alphabetically per level; reasons that are no ledger
-  // account, like "(btw)", come last.
-  const toReasonTree = function( reasons, sign ) {
+  // side's sign, and optionally the Map of what is still open of those.
+  // Sorted alphabetically per level; reasons that are no ledger account, like
+  // "(btw)", come last.
+  const toReasonTree = function( reasons, sign, openReasons ) {
+    const withOpen = function( item, cents ) {
+      return ( openReasons ? { ...item, open: cents } : item );
+    };
+
     const root = new Map();
     const special = [];
-    for ( const [ key, cents ] of reasons ) {
+    for ( const key of new Set( [ ...reasons.keys(), ...( openReasons?.keys() ?? [] ) ] ) ) {
+      const cents = signed( sign, reasons.get( key ) ?? 0 );
+      const open = signed( sign, openReasons?.get( key ) ?? 0 );
       if ( !ledger.has( key ) ) {
-        special.push( {
+        special.push( withOpen( {
           id: null,
           name: specialReasonLabel( key ) ?? key,
-          amount: sign * cents,
-        } );
+          amount: cents,
+        }, open ) );
         continue;
       }
 
@@ -82,41 +111,45 @@ export const addBreakdowns = async function( {
           level.set( id, {
             id,
             own: 0,
+            ownOpen: 0,
             children: new Map(),
           } );
         }
         node = level.get( id );
         level = node.children;
       }
-      node.own += ( sign * cents );
+      node.own += cents;
+      node.ownOpen += open;
     }
 
     const toItem = function( node ) {
       const name = ledger.nameOf( node.id );
       if ( node.children.size === 0 ) {
-        return {
+        return withOpen( {
           id: node.id,
           name,
           amount: node.own,
-        };
+        }, node.ownOpen );
       }
 
       // A parent with amounts of its own as well: list those as "(overig)",
       // so the children still add up to the parent.
       const children = Array.from( node.children.values(), toItem );
-      if ( node.own !== 0 ) {
-        children.push( {
+      if ( ( node.own !== 0 ) || ( node.ownOpen !== 0 ) ) {
+        children.push( withOpen( {
           id: node.id,
           name: `${ name } (overig)`,
           amount: node.own,
-        } );
+        }, node.ownOpen ) );
       }
       labelDuplicates( children ).sort( byName );
 
       return {
-        id: node.id,
-        name,
-        amount: sumAmounts( children ),
+        ...withOpen( {
+          id: node.id,
+          name,
+          amount: sumAmounts( children ),
+        }, sumOpen( children ) ),
         reasons: children,
       };
     };
@@ -138,6 +171,9 @@ export const addBreakdowns = async function( {
   const sideReasons = new Map( sides.map( function( side ) {
     return [ side, new Map() ];
   } ) );
+  const sideOpenReasons = new Map( sides.map( function( side ) {
+    return [ side, new Map() ];
+  } ) );
 
   for ( const [ side, line ] of detailLines ) {
     const ledgerAccount = ledger.get( line.id );
@@ -150,28 +186,41 @@ export const addBreakdowns = async function( {
       console.error( `Warning: the contacts of ${ line.name } add up to ${ toDecimal( line.amount - ( side.sign * difference ) ) } instead of ${ toDecimal( line.amount ) }.` );
     }
 
-    const reasonsByContact = ( ( showReasons || sum ) ? await reasoner( ledgerAccount, result ) : null );
+    // What is still open is worked out per reason, so --open needs the reasons
+    // even when they aren't shown.
+    const {
+      reasons: reasonsByContact,
+      open: openByContact,
+    } = ( ( showReasons || sum || open ) ? await reasoner( ledgerAccount, result ) : {} );
 
-    // The line's reasons over all contacts, plus whatever no contact explains.
-    const lineReasons = new Map();
-    for ( const reasons of reasonsByContact?.values() ?? [] ) {
-      for ( const [ key, cents ] of reasons ) {
-        addTo( lineReasons, key, cents );
+    // The line's reasons over all contacts, plus whatever no contact explains,
+    // which stays open as it is.
+    const merged = function( byContact, target ) {
+      const lineMap = new Map();
+      for ( const reasons of byContact?.values() ?? [] ) {
+        merge( lineMap, reasons );
       }
-    }
-    addTo( lineReasons, differenceKey, difference );
-    for ( const [ key, cents ] of lineReasons ) {
-      addTo( sideReasons.get( side ), key, cents );
+      addTo( lineMap, differenceKey, difference );
+      merge( target, lineMap );
+      return lineMap;
+    };
+    const lineReasons = merged( reasonsByContact, sideReasons.get( side ) );
+    const lineOpenReasons = ( open ? merged( openByContact, sideOpenReasons.get( side ) ) : null );
+    if ( open ) {
+      line.open = signed( side.sign, sumValues( lineOpenReasons ) );
     }
 
     if ( showContacts ) {
       // Largest amounts first: those matter most.
       line.contacts = Array.from( byContact, function( [ id, cents ] ) {
+        const openReasons = ( open ? ( openByContact.get( id ) ?? new Map() ) : undefined );
         return {
           id,
           amount: side.sign * cents,
-          ...( reasonsByContact
-            ? { reasons: toReasonTree( reasonsByContact.get( id ) ?? new Map(), side.sign ) }
+          ...( open ? { open: signed( side.sign, sumValues( openReasons ) ) } : {} ),
+          // -s alone shows the reasons per contact too.
+          ...( ( showReasons || sum )
+            ? { reasons: toReasonTree( reasonsByContact.get( id ) ?? new Map(), side.sign, openReasons ) }
             : {}
           ),
         };
@@ -183,11 +232,12 @@ export const addBreakdowns = async function( {
           id: null,
           name: specialReasonLabel( differenceKey ),
           amount: side.sign * difference,
+          ...( open ? { open: side.sign * difference } : {} ),
         } );
       }
     }
     else if ( showReasons ) {
-      line.reasons = toReasonTree( withoutZeros( lineReasons ), side.sign );
+      line.reasons = toReasonTree( withoutZeros( lineReasons ), side.sign, ( open ? withoutZeros( lineOpenReasons ) : undefined ) );
     }
   }
 
@@ -197,8 +247,26 @@ export const addBreakdowns = async function( {
       if ( detailLines.some( function( [ lineSide ] ) {
         return ( lineSide === side );
       } ) ) {
-        side.reasons = toReasonTree( withoutZeros( sideReasons.get( side ) ), side.sign );
+        side.reasons = toReasonTree( withoutZeros( sideReasons.get( side ) ), side.sign, ( open ? withoutZeros( sideOpenReasons.get( side ) ) : undefined ) );
         side.reasonsAmount = sumAmounts( side.reasons );
+        if ( open ) {
+          side.reasonsOpen = sumOpen( side.reasons );
+        }
+      }
+    }
+  }
+
+  // A group gets the open amount when all its sub-accounts were broken down.
+  if ( open ) {
+    for ( const side of sides ) {
+      for ( const section of side.sections ) {
+        for ( const group of section.groups ) {
+          if ( ( group.children.length > 0 ) && group.children.every( function( child ) {
+            return ( child.open !== undefined );
+          } ) ) {
+            group.open = sumOpen( group.children );
+          }
+        }
       }
     }
   }

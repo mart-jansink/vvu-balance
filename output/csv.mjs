@@ -7,11 +7,15 @@
 //   soort (the reason's account type, such as opbrengsten or kosten, which
 //   tells apart groups with the same name), bedrag
 //
+// With --open, two more columns: opendatum (today) and open (what is still
+// open then of bedrag; empty for amounts that weren't broken down).
+//
 // The format suits a Dutch spreadsheet: ";" between fields, a decimal comma
 // without thousands separators, and CRLF line endings.
 import { toDecimal } from "../util.mjs";
 
-const columns = [ "datum", "zijde", "blok", "sectie", "groep", "rekening", "contact", "redengroep", "reden", "soort", "bedrag" ];
+const baseColumns = [ "datum", "zijde", "blok", "sectie", "groep", "rekening", "contact", "redengroep", "reden", "soort", "bedrag" ];
+const openColumns = [ "opendatum", "open" ];
 
 const field = function( value ) {
   const text = String( value ?? "" );
@@ -24,14 +28,17 @@ const amount = function( cents ) {
 
 // Returns { text, count } for the balance sheet tree (see sheet.mjs) at
 // `date`. The ledger gives the "soort" column.
-export const toCsv = function( { date, sheet, ledger } ) {
+export const toCsv = function( { date, openDate, sheet, ledger } ) {
+  const columns = ( openDate ? [ ...baseColumns, ...openColumns ] : baseColumns );
   const sides = [ [ "activa", sheet.debit ], [ "passiva", sheet.credit ] ];
   const rows = [];
   const push = function( row ) {
     rows.push( {
       datum: date,
+      opendatum: openDate,
       ...row,
       bedrag: amount( row.bedrag ),
+      open: ( ( row.open === undefined ) ? "" : amount( row.open ) ),
     } );
   };
 
@@ -49,6 +56,7 @@ export const toCsv = function( { date, sheet, ledger } ) {
           reden: reason.name,
           soort: ( reason.id ? ledger.typeLabel( reason.id ) : "" ),
           bedrag: reason.amount,
+          open: reason.open,
         } );
       }
     }
@@ -68,6 +76,7 @@ export const toCsv = function( { date, sheet, ledger } ) {
           push( {
             ...withContact,
             bedrag: contact.amount,
+            open: contact.open,
           } );
         }
       }
@@ -79,6 +88,7 @@ export const toCsv = function( { date, sheet, ledger } ) {
       push( {
         ...base,
         bedrag: line.amount,
+        open: line.open,
       } );
     }
   };

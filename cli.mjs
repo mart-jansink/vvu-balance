@@ -22,6 +22,8 @@ Options:
                            -c, per contact and then per reason
   -s, --sum                Add the totals per reason for each side (activa
                            and passiva) over all broken-down ledger accounts
+  -o, --open               Add a column with what is still open today of each
+                           broken-down amount (payments made since deducted)
   -t, --ttl MINUTES        Cache lifetime for months that are not locked (default: 60)
   -r, --refresh            Ignore cached responses for months that are not locked
       --clear-cache        Delete the whole cache and exit
@@ -74,6 +76,7 @@ export const parseCli = function() {
         detail: { type: "string", short: "d", multiple: true },
         reasons: { type: "boolean", short: "l", default: false },
         sum: { type: "boolean", short: "s", default: false },
+        open: { type: "boolean", short: "o", default: false },
         ttl: { type: "string", short: "t", default: "60" },
         refresh: { type: "boolean", short: "r", default: false },
         "clear-cache": { type: "boolean", default: false },
@@ -110,9 +113,9 @@ export const parseCli = function() {
   }
 
   // What to show below a broken-down ledger account. -d on its own means per
-  // contact; with -l or -s it only selects the accounts.
+  // contact; with -l, -s or -o it only selects the accounts.
   const showReasons = options.reasons;
-  const showContacts = ( options.contacts || ( Boolean( options.detail ) && !showReasons && !options.sum ) );
+  const showContacts = ( options.contacts || ( Boolean( options.detail ) && !showReasons && !options.sum && !options.open ) );
 
   return {
     options,
@@ -121,7 +124,7 @@ export const parseCli = function() {
     showContacts,
     showReasons,
     // Ledger accounts to break down (names or ids), or none at all.
-    detail: ( ( showContacts || showReasons || options.sum )
+    detail: ( ( showContacts || showReasons || options.sum || options.open )
       ? ( options.detail ?? defaultDetail ).flatMap( function( value ) {
         return value.split( "," );
       } ).map( function( value ) {
